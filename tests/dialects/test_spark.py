@@ -1,6 +1,6 @@
 from unittest import mock
 
-from sqlglot import exp, parse_one
+from sqlglot import exp, parse_one, transpile
 from sqlglot.dialects.dialect import Dialects
 from sqlglot.errors import ErrorLevel, ParseError, UnsupportedError
 from tests.dialects.test_dialect import Validator
@@ -1346,6 +1346,45 @@ TBLPROPERTIES (
             "SELECT 1 AS a UNION ALL (VALUES (2), (3) AS v(a) ORDER BY 1 DESC LIMIT 1)",
             "SELECT 1 AS a UNION ALL (SELECT * FROM VALUES (2), (3) AS v(a) ORDER BY 1 DESC LIMIT 1)",
         )
+
+    def test_subday_dateadd_preserves_unit(self):
+        # Sub-day units must not collapse into Spark's day-based DATE_ADD. A DateAdd coming from
+        # another dialect becomes TIMESTAMPADD so the unit is kept.
+        for source in ("snowflake", "tsql"):
+            for unit in ("hour", "minute", "second"):
+                self.assertEqual(
+                    transpile(
+                        f"SELECT DATEADD({unit}, 3, ts) FROM t", read=source, write="spark"
+                    )[0],
+                    f"SELECT TIMESTAMPADD({unit.upper()}, 3, ts) FROM t",
+                )
+
+        # Spark2 has no 3-arg DATE_ADD, so it also relies on TIMESTAMPADD
+        self.assertEqual(
+            transpile(
+                "SELECT DATEADD(minute, 10, ts) FROM t", read="snowflake", write="spark2"
+            )[0],
+            "SELECT TIMESTAMPADD(MINUTE, 10, ts) FROM t",
+        )
+
+        # Spark's own 3-arg DATE_ADD / TIMESTAMPADD round-trip with the unit preserved
+        self.validate_identity("SELECT DATE_ADD(HOUR, 3, ts) FROM t")
+        self.assertEqual(
+            transpile(
+                "SELECT TIMESTAMPADD(HOUR, 3, ts) FROM t", read="spark", write="spark2"
+            )[0],
+            "SELECT TIMESTAMPADD(HOUR, 3, ts) FROM t",
+        )
+
+        # Sub-second units cannot be represented: raise rather than silently use days
+        for unit in ("MILLISECOND", "MICROSECOND", "NANOSECOND"):
+            with self.assertRaises(UnsupportedError):
+                transpile(
+                    f"SELECT DATEADD({unit}, 3, ts) FROM t",
+                    read="snowflake",
+                    write="spark",
+                    unsupported_level=ErrorLevel.IMMEDIATE,
+                )
 
     def test_named_struct(self):
         self.validate_all(

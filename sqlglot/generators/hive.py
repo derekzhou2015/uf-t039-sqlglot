@@ -6,10 +6,10 @@ from functools import partial
 
 from sqlglot import exp, generator, transforms
 from sqlglot.dialects.dialect import (
-    array_sort_order,
     DATE_ADD_OR_SUB,
     approx_count_distinct_sql,
     arg_max_or_min_no_count,
+    array_sort_order,
     datestrtodate_sql,
     if_sql,
     left_to_substring_sql,
@@ -18,28 +18,29 @@ from sqlglot.dialects.dialect import (
     no_ilike_sql,
     no_recursive_cte_sql,
     no_trycast_sql,
+    property_sql,
     regexp_extract_sql,
     regexp_replace_sql,
     rename_func,
     right_to_substring_sql,
+    sequence_sql,
     strposition_sql,
     struct_extract_sql,
     time_format,
     timestrtotime_sql,
     trim_sql,
-    weekstart_unit_to_str,
+    unit_to_var,
     var_map_sql,
-    sequence_sql,
-    property_sql,
-)
-from sqlglot.transforms import (
-    remove_unique_constraints,
-    ctas_with_tmp_tables_to_create_tmp_view,
-    preprocess,
-    move_schema_columns_to_partitioned_by,
+    weekstart_unit_to_str,
 )
 from sqlglot.generator import unsupported_args
 from sqlglot.time import format_time
+from sqlglot.transforms import (
+    ctas_with_tmp_tables_to_create_tmp_view,
+    move_schema_columns_to_partitioned_by,
+    preprocess,
+    remove_unique_constraints,
+)
 
 # These constants are duplicated from the Hive dialect class to avoid circular imports.
 # They must be kept in sync with Hive.TIME_FORMAT, Hive.DATE_FORMAT, Hive.DATEINT_FORMAT.
@@ -100,6 +101,11 @@ DATE_DELTA_INTERVAL = {
     "DAY": ("DATE_ADD", 1),
 }
 
+# Sub-day units that Hive's TIMESTAMPADD can represent natively. Anything finer than
+# seconds (MILLISECOND, MICROSECOND, NANOSECOND) has no equivalent and must not be
+# silently reinterpreted as a day-based addition.
+TIMESTAMPADD_UNITS = ("HOUR", "MINUTE", "SECOND")
+
 TIME_DIFF_FACTOR = {
     "MILLISECOND": " * 1000",
     "SECOND": "",
@@ -121,8 +127,29 @@ def _add_date_sql(self: HiveGenerator, expression: DATE_ADD_OR_SUB) -> str:
     if isinstance(expression, exp.TsOrDsAdd) and not expression.unit:
         return self.func("DATE_ADD", expression.this, expression.expression)
 
-    unit = expression.text("unit").upper()
-    func, multiplier = DATE_DELTA_INTERVAL.get(unit, ("DATE_ADD", 1))
+    # An absent unit defaults to a day-based addition, matching Hive's DATE_ADD semantics.
+    unit = expression.text("unit").upper() or "DAY"
+
+    if unit in TIMESTAMPADD_UNITS:
+        # Hive/Spark's DATE_ADD is day-based, so a sub-day unit cannot be mapped onto it
+        # without silently changing the semantics. TIMESTAMPADD preserves the unit instead.
+        increment = expression.expression
+        if isinstance(expression, exp.DateSub):
+            increment = exp.Mul(this=increment, expression=exp.Literal.number(-1))
+
+        return self.func("TIMESTAMPADD", unit_to_var(expression), increment, expression.this)
+
+    if unit not in DATE_DELTA_INTERVAL:
+        self.unsupported(
+            f"Cannot transpile {expression.__class__.__name__} with unit '{unit}' to "
+            f"{self.dialect.__class__.__name__}: no equivalent function exists and falling "
+            "back to a day-based DATE_ADD would silently change its semantics"
+        )
+        # Keep the original expression text rather than emitting a day-based DATE_ADD, which
+        # would compile while carrying the wrong semantics.
+        return self.function_fallback_sql(expression)
+
+    func, multiplier = DATE_DELTA_INTERVAL[unit]
 
     if isinstance(expression, exp.DateSub):
         multiplier *= -1
@@ -370,6 +397,15 @@ class HiveGenerator(generator.Generator):
         exp.TsOrDsAdd: _add_date_sql,
         exp.TsOrDsDiff: _date_diff_sql,
         exp.TsOrDsToDate: _to_date_sql,
+        exp.TimestampAdd: lambda self, e: self.func(
+            "TIMESTAMPADD", unit_to_var(e), e.expression, e.this
+        ),
+        exp.TimestampSub: lambda self, e: self.func(
+            "TIMESTAMPADD",
+            unit_to_var(e),
+            exp.Mul(this=e.expression, expression=exp.Literal.number(-1)),
+            e.this,
+        ),
         exp.TryCast: no_trycast_sql,
         exp.Trim: trim_sql,
         exp.Unicode: rename_func("ASCII"),

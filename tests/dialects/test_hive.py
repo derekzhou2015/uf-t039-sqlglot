@@ -1,5 +1,6 @@
+from sqlglot import UnsupportedError, exp, transpile
+from sqlglot.errors import ErrorLevel
 from tests.dialects.test_dialect import Validator
-from sqlglot import UnsupportedError, exp
 
 
 class TestHive(Validator):
@@ -571,6 +572,108 @@ class TestHive(Validator):
                     "spark": f"{unit}(x)",
                 },
             )
+
+    def test_subday_dateadd(self):
+        # Sub-day units must keep their granularity when targeting the Hive family instead of
+        # being silently reinterpreted as a day-based DATE_ADD.
+        for source in ("snowflake", "tsql"):
+            for unit, expected in (
+                ("hour", "HOUR"),
+                ("minute", "MINUTE"),
+                ("second", "SECOND"),
+            ):
+                for target in ("hive", "spark", "spark2"):
+                    with self.subTest(source=source, unit=unit, target=target):
+                        self.assertEqual(
+                            transpile(
+                                f"SELECT DATEADD({unit}, 3, ts) FROM t",
+                                read=source,
+                                write=target,
+                            )[0],
+                            f"SELECT TIMESTAMPADD({expected}, 3, ts) FROM t",
+                        )
+
+        # Redshift parses DATEADD into a TsOrDsAdd, whose sub-day unit must survive too
+        for target in ("hive", "spark2"):
+            self.assertEqual(
+                transpile(
+                    "SELECT DATEADD(hour, 3, ts) FROM t", read="redshift", write=target
+                )[0],
+                "SELECT TIMESTAMPADD(HOUR, 3, ts) FROM t",
+            )
+
+        # Non-literal and negative increments are preserved as well
+        self.assertEqual(
+            transpile("SELECT DATEADD(hour, n, ts) FROM t", read="snowflake", write="hive")[0],
+            "SELECT TIMESTAMPADD(HOUR, n, ts) FROM t",
+        )
+        self.assertEqual(
+            transpile("SELECT DATEADD(hour, -3, ts) FROM t", read="snowflake", write="spark")[0],
+            "SELECT TIMESTAMPADD(HOUR, -3, ts) FROM t",
+        )
+        self.assertEqual(
+            transpile(
+                "SELECT DATEADD(minute, a + b, ts) FROM t", read="tsql", write="spark"
+            )[0],
+            "SELECT TIMESTAMPADD(MINUTE, a + b, ts) FROM t",
+        )
+        # Date subtraction with a sub-day unit becomes a negated TIMESTAMPADD
+        self.assertEqual(
+            transpile("SELECT DATE_SUB(ts, 2, hour) FROM t", read="snowflake", write="hive")[0],
+            "SELECT TIMESTAMPADD(HOUR, 2 * -1, ts) FROM t",
+        )
+
+        # Hive/Spark can read back their own TIMESTAMPADD output
+        self.assertEqual(
+            transpile(
+                "SELECT TIMESTAMPADD(MINUTE, 3, ts) FROM t", read="spark", write="hive"
+            )[0],
+            "SELECT TIMESTAMPADD(MINUTE, 3, ts) FROM t",
+        )
+        # Spark3 renders a parsed TIMESTAMPADD as its native 3-arg DATE_ADD with the unit intact
+        self.assertEqual(
+            transpile(
+                "SELECT TIMESTAMPADD(SECOND, 3, ts) FROM t", read="hive", write="spark"
+            )[0],
+            "SELECT DATE_ADD(SECOND, 3, ts) FROM t",
+        )
+        # ... while Spark2 and Hive keep TIMESTAMPADD
+        self.assertEqual(
+            transpile(
+                "SELECT TIMESTAMPADD(SECOND, 3, ts) FROM t", read="hive", write="spark2"
+            )[0],
+            "SELECT TIMESTAMPADD(SECOND, 3, ts) FROM t",
+        )
+
+        # Day/week/month/year/quarter behavior is unchanged
+        self.assertEqual(
+            transpile("SELECT DATEADD(day, 3, ts) FROM t", read="snowflake", write="hive")[0],
+            "SELECT DATE_ADD(ts, 3) FROM t",
+        )
+        self.assertEqual(
+            transpile("SELECT DATEADD(week, 3, ts) FROM t", read="snowflake", write="spark")[0],
+            "SELECT DATE_ADD(ts, 21) FROM t",
+        )
+        self.assertEqual(
+            transpile("SELECT DATEADD(month, 3, ts) FROM t", read="snowflake", write="hive")[0],
+            "SELECT ADD_MONTHS(ts, 3) FROM t",
+        )
+        self.assertEqual(
+            transpile("SELECT DATEADD(year, 3, ts) FROM t", read="snowflake", write="spark")[0],
+            "SELECT ADD_MONTHS(ts, 36) FROM t",
+        )
+
+        # Units finer than seconds have no Hive/Spark equivalent: raise instead of silently
+        # degrading to day-based arithmetic.
+        for unit in ("MILLISECOND", "MICROSECOND", "NANOSECOND"):
+            for target in ("hive", "spark"):
+                with self.subTest(unit=unit, target=target), self.assertRaises(UnsupportedError):
+                    transpile(
+                        f"SELECT DATEADD({unit}, 3, ts) FROM t",
+                        read="snowflake",
+                        write=target,
+                        unsupported_level=ErrorLevel.IMMEDIATE,
+                    )
 
     def test_order_by(self):
         self.validate_all(

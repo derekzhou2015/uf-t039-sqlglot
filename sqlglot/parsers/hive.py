@@ -99,6 +99,9 @@ class HiveParser(parser.Parser):
             dialect,
         ),
         "DATE_SUB": _build_date_add,
+        "TIMESTAMPADD": lambda args: exp.TimestampAdd(
+            this=seq_get(args, 2), expression=seq_get(args, 1), unit=seq_get(args, 0)
+        ),
         "DATEDIFF": lambda args: exp.DateDiff(
             this=exp.TsOrDsToDate(this=seq_get(args, 0)),
             expression=exp.TsOrDsToDate(this=seq_get(args, 1)),
